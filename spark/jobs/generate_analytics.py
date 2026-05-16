@@ -1,5 +1,5 @@
 import sys
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 
@@ -44,38 +44,16 @@ def read_table_from_postgres(spark: SparkSession, table: str, config: Dict[str, 
     return spark.read.format("jdbc").options(**config).option("dbtable", table).load()
 
 
-def load_dimension_tables(spark: SparkSession, pg_config: Dict[str, str]) -> Dict[str, DataFrame]:
-    """Loads all dimension tables from PostgreSQL."""
-    return {
-        "fact": read_table_from_postgres(spark, "fact_sales", pg_config),
+def load_fact_and_dimensions(spark: SparkSession, pg_config: Dict[str, str]) -> Tuple[DataFrame, Dict[str, DataFrame]]:
+    """Loads fact table and dimensions separately."""
+    fact_df = read_table_from_postgres(spark, "fact_sales", pg_config)
+    dimensions = {
         "products": read_table_from_postgres(spark, "dim_products", pg_config),
         "customers": read_table_from_postgres(spark, "dim_customers", pg_config),
         "stores": read_table_from_postgres(spark, "dim_stores", pg_config),
         "suppliers": read_table_from_postgres(spark, "dim_suppliers", pg_config)
     }
-
-
-def create_sales_dataframe(dimensions: Dict[str, DataFrame]) -> DataFrame:
-    """Creates the main sales dataframe by joining all dimension tables."""
-    return (
-        dimensions["fact"]
-        .join(dimensions["products"], on="product_id", how="left")
-        .join(dimensions["customers"], on="customer_id", how="left")
-        .join(dimensions["stores"], on="store_id", how="left")
-        .join(dimensions["suppliers"], on="supplier_id", how="left")
-        .withColumn("order_date", F.to_date(F.col("order_date")))
-        .withColumn("year", F.year(F.col("order_date")))
-        .withColumn("month", F.month(F.col("order_date")))
-        .withColumn(
-            "customer_name",
-            F.concat_ws(" ", F.col("first_name").cast("string"), F.col("last_name").cast("string")),
-        )
-        .withColumn(
-            "supplier_name",
-            F.concat_ws(" ", F.col("seller_first_name").cast("string"), F.col("seller_last_name").cast("string")),
-        )
-        .withColumn("review_count", F.when(F.col("review_id").isNull(), F.lit(0)).otherwise(F.lit(1)))
-    )
+    return fact_df, dimensions
 
 
 def write_to_clickhouse(df: DataFrame, table: str, ch_config: Dict[str, str]) -> None:
@@ -91,10 +69,16 @@ def write_to_clickhouse(df: DataFrame, table: str, ch_config: Dict[str, str]) ->
     )
 
 
-def create_top_products_report(sales_df: DataFrame) -> DataFrame:
-    """Creates top 10 products by sales count and revenue."""
+def create_product_sales_data(fact_df: DataFrame, product_dim: DataFrame) -> DataFrame:
     return (
-        sales_df.groupBy("product_id", "product_name", "product_category")
+        fact_df.join(product_dim, on="product_id", how="left")
+    )
+
+
+def create_top_products_report(fact_df: DataFrame, product_dim: DataFrame) -> DataFrame:
+    product_sales = create_product_sales_data(fact_df, product_dim)
+    return (
+        product_sales.groupBy("product_id", "product_name", "product_category")
         .agg(
             F.sum("price").alias("total_revenue"),
             F.count(F.lit(1)).alias("total_sales"),
@@ -104,10 +88,10 @@ def create_top_products_report(sales_df: DataFrame) -> DataFrame:
     )
 
 
-def create_revenue_by_category_report(sales_df: DataFrame) -> DataFrame:
-    """Creates revenue report by product category."""
+def create_revenue_by_category_report(fact_df: DataFrame, product_dim: DataFrame) -> DataFrame:
+    product_sales = create_product_sales_data(fact_df, product_dim)
     return (
-        sales_df.groupBy("product_category")
+        product_sales.groupBy("product_category")
         .agg(
             F.sum("price").alias("total_revenue"),
             F.count(F.lit(1)).alias("total_sales"),
@@ -116,22 +100,34 @@ def create_revenue_by_category_report(sales_df: DataFrame) -> DataFrame:
     )
 
 
-def create_product_rating_reviews_report(sales_df: DataFrame) -> DataFrame:
-    """Creates product rating and reviews report."""
+def create_product_rating_reviews_report(fact_df: DataFrame, product_dim: DataFrame) -> DataFrame:
+    product_sales = create_product_sales_data(fact_df, product_dim)
     return (
-        sales_df.groupBy("product_id", "product_name", "product_category")
+        product_sales.groupBy("product_id", "product_name", "product_category")
         .agg(
             F.avg("rating").alias("avg_rating"),
-            F.sum("review_count").cast("long").alias("review_count"),
+            F.sum(F.when(F.col("review_id").isNull(), F.lit(0)).otherwise(F.lit(1))).cast("long").alias("review_count"),
         )
         .orderBy(F.col("avg_rating").desc())
     )
 
 
-def create_customer_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
-    """Creates various customer analytics reports."""
+def create_customer_sales_data(fact_df: DataFrame, customer_dim: DataFrame) -> DataFrame:
+    """Creates optimized dataset for customer reports."""
+    return (
+        fact_df.join(customer_dim, on="customer_id", how="left")
+        .withColumn(
+            "customer_name",
+            F.concat_ws(" ", F.col("first_name").cast("string"), F.col("last_name").cast("string")),
+        )
+    )
+
+
+def create_customer_analytics(fact_df: DataFrame, customer_dim: DataFrame) -> Dict[str, DataFrame]:
+    customer_sales = create_customer_sales_data(fact_df, customer_dim)
+    
     customer_spend = (
-        sales_df.groupBy("customer_id", "customer_name", "country")
+        customer_sales.groupBy("customer_id", "customer_name", "country")
         .agg(
             F.sum("price").alias("total_spent"),
             F.avg("price").alias("avg_check"),
@@ -145,7 +141,7 @@ def create_customer_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
             .limit(10)
         ),
         "customers_by_country": (
-            sales_df.groupBy("country")
+            customer_sales.groupBy("country")
             .agg(F.countDistinct("customer_id").alias("customers_count"))
             .orderBy(F.col("customers_count").desc())
         ),
@@ -156,11 +152,13 @@ def create_customer_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
     }
 
 
-def create_time_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
+def create_time_analytics(fact_df: DataFrame) -> Dict[str, DataFrame]:
     """Creates various time-based analytics reports."""
+    time_df = fact_df.withColumn("order_date", F.to_date(F.col("order_date")))
+    
     return {
         "monthly_trends": (
-            sales_df.groupBy("year", "month")
+            time_df.groupBy(F.year("order_date").alias("year"), F.month("order_date").alias("month"))
             .agg(
                 F.sum("price").alias("total_revenue"),
                 F.count(F.lit(1)).alias("orders_count"),
@@ -168,7 +166,7 @@ def create_time_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
             .orderBy("year", "month")
         ),
         "yearly_trends": (
-            sales_df.groupBy("year")
+            time_df.groupBy(F.year("order_date").alias("year"))
             .agg(
                 F.sum("price").alias("total_revenue"),
                 F.count(F.lit(1)).alias("orders_count"),
@@ -177,17 +175,24 @@ def create_time_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
             .orderBy("year")
         ),
         "avg_order_by_month": (
-            sales_df.groupBy("year", "month")
+            time_df.groupBy(F.year("order_date").alias("year"), F.month("order_date").alias("month"))
             .agg(F.avg("price").alias("avg_order_value"))
             .orderBy("year", "month")
         )
     }
 
 
-def create_store_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
+def create_store_sales_data(fact_df: DataFrame, store_dim: DataFrame) -> DataFrame:
+    """Creates optimized dataset for store reports."""
+    return fact_df.join(store_dim, on="store_id", how="left")
+
+
+def create_store_analytics(fact_df: DataFrame, store_dim: DataFrame) -> Dict[str, DataFrame]:
     """Creates various store analytics reports."""
+    store_sales = create_store_sales_data(fact_df, store_dim)
+    
     store_base = (
-        sales_df.groupBy("store_id", "store_name", "store_city", "store_state")
+        store_sales.groupBy("store_id", "store_name", "store_city", "store_state")
         .agg(
             F.sum("price").alias("total_revenue"),
             F.avg("price").alias("avg_check"),
@@ -213,10 +218,23 @@ def create_store_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
     }
 
 
-def create_supplier_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
+def create_supplier_sales_data(fact_df: DataFrame, supplier_dim: DataFrame) -> DataFrame:
+    """Creates optimized dataset for supplier reports."""
+    return (
+        fact_df.join(supplier_dim, on="supplier_id", how="left")
+        .withColumn(
+            "supplier_name",
+            F.concat_ws(" ", F.col("seller_first_name").cast("string"), F.col("seller_last_name").cast("string")),
+        )
+    )
+
+
+def create_supplier_analytics(fact_df: DataFrame, supplier_dim: DataFrame) -> Dict[str, DataFrame]:
     """Creates various supplier analytics reports."""
+    supplier_sales = create_supplier_sales_data(fact_df, supplier_dim)
+    
     supplier_base = (
-        sales_df.groupBy("supplier_id", "supplier_name", "seller_country")
+        supplier_sales.groupBy("supplier_id", "supplier_name", "seller_country")
         .agg(
             F.sum("price").alias("total_revenue"),
             F.avg("price").alias("avg_price"),
@@ -231,7 +249,7 @@ def create_supplier_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
             .orderBy(F.col("avg_price").desc())
         ),
         "suppliers_by_country": (
-            sales_df.groupBy("seller_country")
+            supplier_sales.groupBy("seller_country")
             .agg(
                 F.sum("price").alias("total_revenue"),
                 F.countDistinct("supplier_id").alias("suppliers_count"),
@@ -241,15 +259,16 @@ def create_supplier_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
         )
     }
 
-
-def create_product_quality_analytics(sales_df: DataFrame) -> Dict[str, DataFrame]:
+def create_product_quality_analytics(fact_df: DataFrame, product_dim: DataFrame) -> Dict[str, DataFrame]:
     """Creates product quality analytics reports."""
+    product_sales = create_product_sales_data(fact_df, product_dim)
+    
     product_quality = (
-        sales_df.groupBy("product_id", "product_name", "product_category")
+        product_sales.groupBy("product_id", "product_name", "product_category")
         .agg(
             F.avg("rating").alias("avg_rating"),
             F.count(F.lit(1)).alias("total_sales"),
-            F.sum("review_count").cast("long").alias("review_count"),
+            F.sum(F.when(F.col("review_id").isNull(), F.lit(0)).otherwise(F.lit(1))).cast("long").alias("review_count"),
         )
     )
     
@@ -271,27 +290,29 @@ def create_product_quality_analytics(sales_df: DataFrame) -> Dict[str, DataFrame
     }
 
 
-def generate_all_reports(sales_df: DataFrame, ch_config: Dict[str, str]) -> None:
-    """Generates and writes all analytics reports to ClickHouse."""
-    # Product reports
+def generate_all_reports(fact_df: DataFrame, dimensions: Dict[str, DataFrame], ch_config: Dict[str, str]) -> None:
+    """Generates and writes all analytics reports to ClickHouse with optimized joins."""
+
+    print("Creating product analytics reports...")
     write_to_clickhouse(
-        create_top_products_report(sales_df), 
+        create_top_products_report(fact_df, dimensions["products"]), 
         "analytics.report_products_top10", 
         ch_config
     )
     write_to_clickhouse(
-        create_revenue_by_category_report(sales_df), 
+        create_revenue_by_category_report(fact_df, dimensions["products"]), 
         "analytics.report_products_revenue_by_category", 
         ch_config
     )
     write_to_clickhouse(
-        create_product_rating_reviews_report(sales_df), 
+        create_product_rating_reviews_report(fact_df, dimensions["products"]), 
         "analytics.report_products_rating_reviews", 
         ch_config
     )
     
-    # Customer reports
-    customer_reports = create_customer_analytics(sales_df)
+    # Customer reports - only join customer dimension
+    print("Creating customer analytics reports...")
+    customer_reports = create_customer_analytics(fact_df, dimensions["customers"])
     write_to_clickhouse(
         customer_reports["top_customers"], 
         "analytics.report_customers_top10", 
@@ -308,8 +329,9 @@ def generate_all_reports(sales_df: DataFrame, ch_config: Dict[str, str]) -> None
         ch_config
     )
     
-    # Time-based reports
-    time_reports = create_time_analytics(sales_df)
+    # Time-based reports - no joins needed
+    print("Creating time analytics reports...")
+    time_reports = create_time_analytics(fact_df)
     write_to_clickhouse(
         time_reports["monthly_trends"], 
         "analytics.report_time_monthly_trends", 
@@ -326,8 +348,9 @@ def generate_all_reports(sales_df: DataFrame, ch_config: Dict[str, str]) -> None
         ch_config
     )
     
-    # Store reports
-    store_reports = create_store_analytics(sales_df)
+    # Store reports - only join store dimension
+    print("Creating store analytics reports...")
+    store_reports = create_store_analytics(fact_df, dimensions["stores"])
     write_to_clickhouse(
         store_reports["top_stores"], 
         "analytics.report_stores_top5", 
@@ -344,8 +367,8 @@ def generate_all_reports(sales_df: DataFrame, ch_config: Dict[str, str]) -> None
         ch_config
     )
     
-    # Supplier reports
-    supplier_reports = create_supplier_analytics(sales_df)
+    print("Creating supplier analytics reports...")
+    supplier_reports = create_supplier_analytics(fact_df, dimensions["suppliers"])
     write_to_clickhouse(
         supplier_reports["top_suppliers"], 
         "analytics.report_suppliers_top5", 
@@ -362,8 +385,8 @@ def generate_all_reports(sales_df: DataFrame, ch_config: Dict[str, str]) -> None
         ch_config
     )
     
-    # Product quality reports
-    quality_reports = create_product_quality_analytics(sales_df)
+    print("Creating product quality analytics reports...")
+    quality_reports = create_product_quality_analytics(fact_df, dimensions["products"])
     write_to_clickhouse(
         quality_reports["best_worst_products"], 
         "analytics.report_quality_best_worst_products", 
@@ -390,10 +413,11 @@ def main():
         pg_config = get_postgres_config()
         ch_config = get_clickhouse_config()
         
-        dimensions = load_dimension_tables(spark, pg_config)
-        sales_df = create_sales_dataframe(dimensions)
+        # Load fact table and dimensions separately
+        fact_df, dimensions = load_fact_and_dimensions(spark, pg_config)
         
-        generate_all_reports(sales_df, ch_config)
+        # Generate reports with optimized joins
+        generate_all_reports(fact_df, dimensions, ch_config)
         
         print("ETL pipeline completed successfully! All reports generated.")
         
