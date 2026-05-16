@@ -1,0 +1,35 @@
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: postgres_bd
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./data:/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse_bd
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      - ALLOW_EMPTY_PASSWORD=yes
+
+  spark:
+    image: apache/spark:3.4.1
+    container_name: spark_bd
+    volumes:
+      - ./spark/jobs:/opt/jobs
+      - ./spark/jars:/opt/jars
+    depends_on:
+      - postgres
+      - clickhouse
+    command: tail -f /dev/null
