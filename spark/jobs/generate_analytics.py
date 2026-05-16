@@ -5,11 +5,16 @@ from pyspark.sql import functions as F
 
 
 def create_spark_session() -> SparkSession:
-    """Creates and returns a SparkSession with PostgreSQL and ClickHouse JDBC drivers."""
+    """Creates and returns a SparkSession with PostgreSQL and ClickHouse JDBC drivers and memory configurations."""
     return (
         SparkSession.builder
         .appName("ETL to ClickHouse")
         .config("spark.jars", "/opt/jars/postgresql.jar,/opt/jars/clickhouse-jdbc.jar")
+        .config("spark.driver.memory", "1g")
+        .config("spark.driver.maxResultSize", "512m")
+        .config("spark.sql.debug.maxToStringFields", "50")
+        .config("spark.sql.autoBroadcastJoinThreshold", "10m")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .getOrCreate()
     )
 

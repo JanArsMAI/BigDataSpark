@@ -100,14 +100,22 @@ cat sql/analytics_schema.sql | docker exec -i clickhouse_bd clickhouse-client --
 
 echo "Running star schema creation..."
 docker exec spark_bd /opt/spark/bin/spark-submit \
+    --properties-file /opt/spark/conf/spark-defaults.conf \
     --jars /opt/jars/postgresql.jar \
-    --master local[*] \
+    --master local[2] \
+    --driver-memory 1g \
+    --executor-memory 1g \
+    --conf spark.sql.shuffle.partitions=2 \
     /opt/jobs/create_star_schema.py
 
 echo "Generating analytics reports..."
 docker exec spark_bd /opt/spark/bin/spark-submit \
+    --properties-file /opt/spark/conf/spark-defaults.conf \
     --jars /opt/jars/postgresql.jar,/opt/jars/clickhouse-jdbc.jar \
-    --master local[*] \
+    --master local[2] \
+    --driver-memory 1g \
+    --executor-memory 1g \
+    --conf spark.sql.shuffle.partitions=2 \
     /opt/jobs/generate_analytics.py
 
 echo " Pipeline completed successfully!"

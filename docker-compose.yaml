@@ -29,7 +29,13 @@ services:
     volumes:
       - ./spark/jobs:/opt/jobs
       - ./spark/jars:/opt/jars
+      - ./spark/conf:/opt/spark/conf
     depends_on:
       - postgres
       - clickhouse
+    environment:
+      - SPARK_DRIVER_MEMORY=1g
+      - SPARK_EXECUTOR_MEMORY=1g
+      - SPARK_EXECUTOR_CORES=1
+      - PYSPARK_PYTHON=python3
     command: tail -f /dev/null

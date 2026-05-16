@@ -5,11 +5,16 @@ from pyspark.sql.functions import col, monotonically_increasing_id
 
 
 def create_spark_session() -> SparkSession:
-    """Creates and returns a SparkSession with PostgreSQL JDBC driver."""
+    """Creates and returns a SparkSession with PostgreSQL JDBC driver and memory configurations."""
     return (
         SparkSession.builder
         .appName("ETL to Star Schema")
         .config("spark.jars", "/opt/jars/postgresql.jar")
+        .config("spark.driver.memory", "1g")
+        .config("spark.driver.maxResultSize", "512m")
+        .config("spark.sql.debug.maxToStringFields", "50")
+        .config("spark.sql.autoBroadcastJoinThreshold", "10m")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .getOrCreate()
     )
 
